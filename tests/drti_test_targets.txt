@@ -1,0 +1,11 @@
+_Z12test_target1v
+_Z12test_target2v
+_Z12test_target4b
+_ZL5test1RPKv
+_ZL5test4RPKvb
+_ZL6invokePFPKvvERS0_
+_ZL5test1v
+_ZL5test2i
+_ZL5test3i
+_ZL5test4v
+_Z9call_leafv
