@@ -62,15 +62,20 @@ DEBUG = -g
 LTO =
 WARN = -Wall -Werror
 DEP = -MMD
+LLCFLAGS = --relocation-model=pic
 
 CXXFLAGS = $(DEP) $(INCLUDES) $(PIC) $(OPT) $(WARN) $(DEBUG) $(LTO)
 LDFLAGS_SHARED = -Wl,-zdefs
 LINK.o = $(LINK.cc)
 
-CLEANABLE = core.* *.d *.o *.so *.a *.ii *.ll *.bc perf.data callgrind.* perf.*
+CLEANABLE = core.* *.d *.bcd *.o *.so *.a *.ii *.ll *.bc perf.data callgrind.* perf.*
 
 %.bc: %.cpp
 	$(CLANG) $(CXXFLAGS) -emit-llvm -o $@ -c $<
+
+# Duplicate the .o dependencies for .bc targets
+%.bcd: %.d
+	sed 's/[.]o:/.bc:/' $< >$@
 
 %.o: %.bc
 	$(LLC) $(LLCFLAGS) -filetype=obj -o $@ $<

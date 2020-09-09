@@ -32,6 +32,3 @@ clean:
 	$(MAKE) -C drti clean
 	$(MAKE) -C passes clean
 	$(MAKE) -C tests clean
-	$(MAKE) -C example/asm clean
-	$(MAKE) -C lto_example/fpointers_simple clean
-	$(MAKE) -C lto_example/fpointers_drti clean

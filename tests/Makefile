@@ -28,7 +28,9 @@ include ../drti_base.mk
 
 OPT = -O3
 
-LOAD_DRTI_PASS = -load $(DRTI_BASE_DIR)passes/libdrti.so -debug-only=drti
+DRTI_LIB = $(DRTI_BASE_DIR)passes/libdrti.so
+
+LOAD_DRTI_PASS = -load $(DRTI_LIB) -debug-only=drti
 
 LLCFLAGS += $(LOAD_DRTI_PASS)
 
@@ -46,7 +48,8 @@ DRTI_MODULES = \
 	test_target1 \
 	test_target2 \
 	test_target3 \
-	test_target4
+	test_target4 \
+	test_class
 
 PLAIN_MODULES = \
 	test_support
@@ -64,9 +67,12 @@ intercept_tests-drti: \
 	$(DRTI_MODULES:%=%-drti.o) \
 	$(PLAIN_MODULES:%=%.o)
 
-%-drti.bc: %.bc %.o ~/dev/drti/passes/libdrti.so $(DRTI_TARGETS_FILE)
+%-drti.bc: %.bc $(DRTI_LIB) $(DRTI_TARGETS_FILE)
 	$(LLVM_OPT) $(LOAD_DRTI_PASS) $(OPT) -drti-decorate -o $@ $<
 
 CLEANABLE += raw_tests-drti intercept_tests-drti
 
 include ../drti_end.mk
+
+# Copies of the .o dependencies for .bc targets
+-include $(depfiles:.d=.bcd)

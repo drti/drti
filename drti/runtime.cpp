@@ -29,6 +29,7 @@
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
+#include "llvm/IR/Constant.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/IRBuilder.h"
@@ -75,7 +76,9 @@ namespace drti
         void globalsMap(
             llvm::orc::SymbolMap& map,
             llvm::orc::MangleAndInterner&,
-            llvm::StringRef excludedFunctionName);
+            //! Other module to check for function definitions (if we
+            //! have a definition we want to be able to recompile it)
+            llvm::Module& availableModule);
 
         landing_site& m_landing_site;
         reflect& m_self;
@@ -94,6 +97,20 @@ namespace drti
         void linkModules();
         void reprocess(llvm::Function*, ReflectedModule&, const static_callsite&);
         void reprocess(llvm::CallBase* callInst, ReflectedModule& leaf);
+
+        llvm::Function* findConverter(
+            llvm::Type* fromType, llvm::Type* toType) const;
+
+        llvm::Value* maybeCoerce(
+            llvm::IRBuilder<>& builder,
+            llvm::Use& argUse,
+            llvm::Argument& parameter,
+            int alreadyCoerced) const;
+
+        llvm::Value* argTypeMismatch(
+            const llvm::Use& argUse,
+            const llvm::Argument& parameter,
+            const llvm::Function& function) const;
 
         void optimize();
 
@@ -326,7 +343,7 @@ llvm::Function* drti::ReflectedModule::callsite_function()
 void drti::ReflectedModule::globalsMap(
     llvm::orc::SymbolMap& map,
     llvm::orc::MangleAndInterner& mangler,
-    llvm::StringRef excludedFunctionName)
+    llvm::Module& availableModule)
 {
     // We must process these in exactly the same order as the code
     // that populated the reflect.globals (see drti-decorate.cpp)
@@ -400,13 +417,19 @@ void drti::ReflectedModule::globalsMap(
         // in collect_globals from drti-decorate.cpp
         if(function.isDeclaration() && !function.isIntrinsic())
         {
-            if(function.getName() == excludedFunctionName)
+            llvm::Function* found =
+                availableModule.getFunction(function.getName());
+
+            if(found && !found->isDeclaration())
             {
+                // We have a definition for this function so
+                // potentially want to recompile it at runtime, rather
+                // than resolving against a saved global address.
                 if(config.log_level >= log_level::debug)
                 {
                     log_stream
-                        << "DRTI not mapping target function "
-                        << excludedFunctionName.str()
+                        << "DRTI not mapping available function "
+                        << function.getName().str()
                         << "\n";
                 }
             }
@@ -440,8 +463,8 @@ drti::TreenodeCompiler::TreenodeCompiler(treenode* node) :
 
     llvm::orc::SymbolMap globals_map;
 
-    m_leaf.globalsMap(globals_map, mangler, llvm::StringRef(nullptr, 0));
-    m_caller.globalsMap(globals_map, mangler, m_leaf.m_landing_site.function_name);
+    m_leaf.globalsMap(globals_map, mangler, *m_caller.m_module);
+    m_caller.globalsMap(globals_map, mangler, *m_leaf.m_module);
 
     llvm::cantFail(
         jit.getMainJITDylib().define(
@@ -501,6 +524,116 @@ void drti::TreenodeCompiler::linkModules()
     m_leaf.m_module = m_caller.m_module;
 }
 
+static std::string describeType(llvm::Type* type)
+{
+    // Currently only works for struct types and pointers thereto
+
+    std::string suffix;
+    while(llvm::PointerType* cast = llvm::dyn_cast<llvm::PointerType>(type))
+    {
+        suffix += "*";
+        type = cast->getElementType();
+    }
+
+    if(type->isStructTy())
+    {
+        return type->getStructName().str() + suffix;
+    }
+    else
+    {
+        return std::string();
+    }
+}
+
+llvm::Function* drti::TreenodeCompiler::findConverter(
+    llvm::Type* fromType, llvm::Type* toType) const
+{
+    for(llvm::Function& function: *m_leaf.m_module)
+    {
+        // Workaround C++ name mangling on the __drti_converter
+        if((function.getName().str().find("__drti_converter") != std::string::npos)
+           && (function.arg_size() == 2)
+           && (function.arg_begin()->getType() == fromType)
+           && ((function.arg_begin() + 1)->getType() == toType)
+           && (function.getReturnType() == toType))
+        {
+            return &function;
+        }
+    }
+    return nullptr;
+}
+
+llvm::Value* drti::TreenodeCompiler::maybeCoerce(
+    llvm::IRBuilder<>& builder,
+    llvm::Use& argUse,
+    llvm::Argument& parameter,
+    int alreadyCoerced) const
+{
+    llvm::Type* useType = argUse.get()->getType();
+    llvm::Type* paramType = parameter.getType();
+
+    if(useType == paramType)
+    {
+        return argUse.get();
+    }
+    else if(alreadyCoerced > 1 || parameter.getArgNo() > 1)
+    {
+        // Sanity check - the virtual function's "this" pointer can't
+        // be later than the second parameter and we would never have
+        // more than two coercions in a single virtual function
+        // call. On the other hand we do want to allow covariant
+        // return types and return value optimisation.
+        return nullptr;
+    }
+    else if(llvm::Function* converter = findConverter(useType, paramType))
+    {
+        llvm::Value* converterArg[] = {
+            argUse.get(), llvm::Constant::getNullValue(paramType)
+        };
+        llvm::Value* result = builder.CreateCall(
+            converter, converterArg, "drti_coerced");
+        ++alreadyCoerced;
+        return result;
+    }
+    else
+    {
+        return nullptr;
+    }
+}
+
+llvm::Value* drti::TreenodeCompiler::argTypeMismatch(
+    const llvm::Use& argUse,
+    const llvm::Argument& parameter,
+    const llvm::Function& function) const
+{
+    llvm::Type* useType = argUse.get()->getType();
+    llvm::Type* paramType = parameter.getType();
+    if(config.log_level >= log_level::error)
+    {
+        log_stream
+            << "DRTI type mismatch for call resolved to "
+            << function.getName().str()
+            << " at argument "
+            // These number from zero as you undoutably know
+            << parameter.getArgNo();
+
+        std::string useTypeName = describeType(useType);
+        std::string paramTypeName = describeType(paramType);
+
+        if(!useTypeName.empty() && ! paramTypeName.empty())
+        {
+            log_stream
+                << " (" << useTypeName
+                << " but expecting " << paramTypeName
+                << ")";
+        }
+
+        log_stream
+            << "\n";
+    }
+    throw InternalCompilerError();
+}
+
 void drti::TreenodeCompiler::reprocess(
     llvm::CallBase* callInst, ReflectedModule& leaf)
 {
@@ -555,11 +688,43 @@ void drti::TreenodeCompiler::reprocess(
 
     // The inlinable function call
     builder.SetInsertPoint(bb2);
+
+    if(callInst->arg_size() != leaf.callsite_function()->arg_size())
+    {
+        if(config.log_level >= log_level::error)
+        {
+            log_stream
+                << "DRTI call with "
+                << callInst->arg_size()
+                << " arguments resolved to "
+                << leaf.callsite_function()->getName().str()
+                << " which expects "
+                << leaf.callsite_function()->arg_size()
+                << "\n";
+        }
+        throw InternalCompilerError();
+    }
+
     llvm::SmallVector<llvm::Value*, 20> args;
+    llvm::iterator_range<llvm::Function::arg_iterator> targetArgs(
+        leaf.callsite_function()->args());
+    int alreadyCoerced = 0;
     for(llvm::Use& argUse: callInst->arg_operands())
     {
-        args.push_back(argUse.get());
+        llvm::Value* arg =
+            maybeCoerce(builder, argUse, *targetArgs.begin(), alreadyCoerced);
+
+        if(arg)
+        {
+            args.push_back(arg);
+        }
+        else
+        {
+            argTypeMismatch(
+                argUse, *targetArgs.begin(), *leaf.callsite_function());
+        }
     }
+
     llvm::CallBase* directCall = builder.CreateCall(
         leaf.callsite_function(), args);
     builder.CreateBr(bb4);
@@ -632,6 +797,18 @@ void drti::TreenodeCompiler::reprocess(
                     // function global. TODO - optimise this ahead of time
                     if(!calledFunction)
                     {
+                        if(config.log_level >= log_level::info)
+                        {
+                            log_stream
+                                << "DRTI "
+                                << function->getName().str()
+                                << " call_number "
+                                << call_number
+                                << " resolved to "
+                                << leaf.m_landing_site.function_name
+                                << "\n";
+                        }
+
                         reprocess(callInst, leaf);
                     }
                     return;
@@ -712,6 +889,15 @@ void* drti::TreenodeCompiler::compile()
     }
 
     optimize();
+
+    if(config.log_level >= log_level::debug)
+    {
+        llvm::raw_os_ostream stream(std::cerr);
+        std::unique_ptr<llvm::ModulePass> printer(
+            llvm::createPrintModulePass(
+                stream, "------- post-optimize -------"));
+        printer->runOnModule(*m_caller.m_module);
+    }
 
     llvm::Error bad = jit.addIRModule(
         llvm::orc::ThreadSafeModule(

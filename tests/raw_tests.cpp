@@ -31,13 +31,21 @@
 #include <cassert>
 
 #include "test_support.hpp"
+#include "test_class.hpp"
 
 using test_function_type1 = const void* (*)();
 
 enum class result_type { pass, fail, known_bug };
 
-// Prevent inlining during ahead-of-time compilation
-__attribute__((noinline)) static bool test1(const void*& last_result)
+// This prevents inlining during ahead-of-time compilation. We need a
+// chain of at least two decorated and not inlined calls in order to
+// inline anything at runtime.
+//
+// TODO - investigate stack maps to see if we can handle callsites
+// more generally
+#define NOT_INLINED __attribute__((noinline))
+
+NOT_INLINED static bool test1(const void*& last_result)
 {
     // Inlining this kind of direct call is possible via link-time
     // optimisation as well, of course.
@@ -51,10 +59,7 @@ __attribute__((noinline)) static bool test1(const void*& last_result)
     return next_result != last_result;
 }
 
-// Prevent inlining during ahead-of-time compilation. Note that we
-// need a chain of at least two calls in order to inline anything at
-// runtime
-__attribute__((noinline)) static result_type test1()
+NOT_INLINED static result_type test1()
 {
     const void* last_result = nullptr;
 
@@ -73,11 +78,11 @@ __attribute__((noinline)) static result_type test1()
 }
 
 // Invocation via function pointer
-__attribute__((noinline)) static bool invoke(
+NOT_INLINED static bool invoke(
     test_function_type1 target, const void*& last_result)
 {
     // Inlining this kind of function pointer call is difficult to
-    // inline at link time
+    // do at link time
     const void* next_result = target();
 
     if(!last_result)
@@ -88,7 +93,7 @@ __attribute__((noinline)) static bool invoke(
     return next_result != last_result;
 }
 
-__attribute__((noinline)) static result_type test2(int external_data)
+NOT_INLINED static result_type test2(int external_data)
 {
     // This is just like test1 except it forces the choice of target
     // function to be dependent on data available only at runtime and
@@ -111,7 +116,7 @@ __attribute__((noinline)) static result_type test2(int external_data)
     return result_type::fail;
 }
 
-__attribute__((noinline)) static result_type test3(int external_data)
+NOT_INLINED static result_type test3(int external_data)
 {
     // This invokes a non-decorated function with a tail-call. Since
     // it isn't decorated its return value should never change
@@ -132,7 +137,7 @@ __attribute__((noinline)) static result_type test3(int external_data)
     return result_type::pass;
 }
 
-__attribute__((noinline)) static bool test4(const void*& last_result, bool do_throw)
+NOT_INLINED static bool test4(const void*& last_result, bool do_throw)
 {
     const void* next_result = test_target4(do_throw);
 
@@ -144,10 +149,7 @@ __attribute__((noinline)) static bool test4(const void*& last_result, bool do_th
     return next_result != last_result;
 }
 
-// Prevent inlining during ahead-of-time compilation. Note that we
-// need a chain of at least two calls in order to inline anything at
-// runtime
-__attribute__((noinline)) static result_type test4()
+NOT_INLINED static result_type test4()
 {
     const void* last_result = nullptr;
     bool value_changed = false;
@@ -184,6 +186,44 @@ __attribute__((noinline)) static result_type test4()
     return result_type::fail;
 }
 
+// Invocation via virtual function call
+NOT_INLINED static bool invoke_virtual(
+    drti_test::interface& object, const void*& last_result)
+{
+    // Inlining virtual function calls is difficult to do at link time
+    const void* next_result = object.virtual_function();
+
+    if(!last_result)
+    {
+        last_result = next_result;
+    }
+
+    return next_result != last_result;
+}
+
+NOT_INLINED static result_type test5()
+{
+    // This is like test2 but using a virtual function instead of
+    // function pointer
+
+    std::unique_ptr<drti_test::interface> object(
+        drti_test::interface::create());
+
+    const void* last_result = nullptr;
+
+    for(int count = 0; count < 1000; ++count)
+    {
+        if(invoke_virtual(*object, last_result))
+        {
+            // Success!
+            std::cout << "test5 passed\n";
+            return result_type::pass;
+        }
+    }
+    std::cout << "test5 failed: return value never changed\n";
+    return result_type::fail;
+}
+
 bool all_passed(int external_data)
 {
     int tried = 0;
@@ -211,6 +251,7 @@ bool all_passed(int external_data)
     check(test2(external_data));
     check(test3(external_data));
     check(test4());
+    check(test5());
 
     std::cout
         << "Ran "

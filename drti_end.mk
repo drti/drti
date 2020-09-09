@@ -24,7 +24,9 @@
 # 2019/11/11   rmg     File creation
 #
 
--include *.d
+depfiles := $(wildcard *.d)
+
+-include $(depfiles)
 
 clean:
 	rm -f $(CLEANABLE)

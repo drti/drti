@@ -34,6 +34,22 @@ extern const void* test_target2();
 extern const void* test_target3();
 extern const void* test_target4(bool);
 
+//! Generate a support function to allow DRTI to convert between
+//! (pointer) types at runtime. This is necessary to make virtual
+//! function calls work, since during inlining a call to (e.g.) void
+//! virtual_function(base*) actually resolves to void
+//! virtual_function(derived*). This is really just a workaround; to
+//! make this work properly we would want the C++ front-end to provide
+//! something equivalent to this.
+#define DRTI_CONVERTIBLE(SOURCE_TYPE, TARGET_TYPE)     \
+    __attribute__((used, always_inline)) static inline \
+    TARGET_TYPE __drti_converter(                      \
+        /* Dummy argument makes overloading work */    \
+        SOURCE_TYPE value, TARGET_TYPE /* dummy */)    \
+    {                                                  \
+        return static_cast<TARGET_TYPE>(value);        \
+    }
+
 namespace drti_test
 {
     //! Return the current value of the instruction pointer register
