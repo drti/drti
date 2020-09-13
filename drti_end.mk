@@ -1,7 +1,6 @@
-#!/usr/bin/bash
-# -*- mode:sh -*-
+# -*- mode:makefile -*-
 #
-# Shell script drti_end.mk
+# Make include file drti_end.mk
 #
 # Copyright (c) 2019, 2020 Raoul M. Gough
 #
