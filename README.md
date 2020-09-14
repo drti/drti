@@ -34,6 +34,34 @@ to improve the speed of any real-world applications.
 For now the code only works on Linux on the x86-64 architecture. It is
 dependent on version 9.0.1 of the LLVM libraries.
 
+## Building the code
+
+In theory it should be possible to clone the git repository and build
+on a supported platform with the correct version (9.0.1) of the LLVM
+libraries installed. You can then build and execute the tests using
+make in the top-level drti directory, providing the paths to root of
+the LLVM installation (where it can find bin/llvm-config)
+
+e.g.
+```sh
+make LLVM_EXE_ROOT_DIR=$(HOME)/llvm-9.0.1 LLVM_LIB_ROOT_DIR=$(HOME)/llvm-9.0.1
+```
+
+Please send [the
+author](mailto:62238636+drti@users.noreply.github.com) feedback if you
+try this out; I would be interested to here if anyone else gets it
+working.
+
+## Examples and tests
+
+There are some tests in tests subdirectory which demonstrate function
+pointer and virtual function inlining. The Makefiles contain the logic
+for building the DRTI decoration pass, the runtime support functions
+and for invoking the decoration pass on the test code. As noted in the
+"Implementation" section, currently DRTI requires an explicit list of
+candidate functions to decorate which is contained in
+tests/drti_test_targets.txt
+
 ## Implementation
 
 This section details some of the complexities of making DRTI work,
@@ -51,15 +79,16 @@ The problem, then, is for one decorated function to discover when the
 target of a function call is another decorated function. Or to put it
 another way, two decorated functions have to be able to recognise an
 edge between them in the call graph, but only when it is a **direct**
-edge with no intervening calls. The second part is very important,
-since a call chain from A* -> B -> C* (where only A* and C* are
-decorated functions) must not result in mistakenly recompiling A with
-a direct call to C.
+edge with no intervening calls. The second condition is very
+important, since a call chain from A* -> B -> C* (where only A* and C*
+are decorated functions) must not result in mistakenly recompiling A
+with a direct call to C.
 
 Unfortunately that means that a simple solution such as using
-Thread-Specific Storage to retain a DRTI call stack won't simply work,
-because only decorated functions would update the state and
-intermediate non-decorated functions would be difficult to detect.
+thread-specific storage (TSS) to retain a per-thread DRTI call stack
+won't simply work, because only decorated functions would update the
+state and intermediate non-decorated functions would be difficult to
+detect.
 
 I thought about this problem for a while and have come up with what I
 believe is a robust mechanism for communication between decorated
@@ -76,48 +105,54 @@ of r11 can be overwritten before arriving at the called function. I've
 chosen r14 to avoid unnecessary incompatibility with the [swiftcall
 convention](https://clang.llvm.org/docs/AttributeReference.html#swift-context)
 after coming across [D18092](https://reviews.llvm.org/D18092) and
-[D18108](https://reviews.llvm.org/D18108).
+[D18108](https://reviews.llvm.org/D18108). For this part using TSS
+would also work, but the register mechanism is a bit simpler.
 
 The second and trickier part is to get a decorated function to
 recognise when the r14 register is valid on entry, i.e. when the call
 came directly from another decorated function. Perhaps surprisingly,
 there is a way to do this by passing information via the return
 address which is pushed onto the stack by the caller. The return
-address normally points to the next instruction after a call, so if we
-organise for the bytes preceding the return address to contain a
-"magic" value, the callee can get the return address from the stack
-and dereference it (minus an offset) to check for the magic
-value. This assumes that the magic value could not occur in a real
-call instruction, and also that the return address is not too close to
-the start of a page boundary, since the preceding page isn't
-guaranteed to be readable. If there are any other runtime
-instrumentation systems using the same trick it would also require
-that they choose a distinct magic value, of course.
+address normally points to the next instruction after a call, but if
+we organise for the bytes preceding the return address to contain a
+"magic" value instead of a call instruction, the callee can get the
+return address from the stack and dereference it (minus an offset) to
+check for the magic value. This assumes that the magic value could not
+occur in a real call instruction, and also that the return address is
+not too close to the start of a page boundary, since the preceding
+page isn't guaranteed to be readable and we don't want to SEGV in any
+circumstances. If there are any other runtime instrumentation systems
+using the same trick it would also require that they choose a distinct
+magic value, of course.
 
-This actually leaves one gap in the detection mechanism since an
-undecorated function that "tail" calls a decorated function via a jump
-does not push a return address; it leaves its own caller's return
-address on top of the stack. So in the call chain A* -> B -> C* where
-B -> C* is a jump rather than a call, C* would mistakenly conclude
-that it had been called directly by A*. There is a way out of this
-problem though, since B is required to preserve the callee-saved r14
-register. This means that C* can safely read the call tree information
-provided by A* and examine the final call's target address to
-determine whether the call could have gone directly to C* or not. This
-is made more complicated by the presence of the procedure linkage
-table and virtual function call "thunks" but is doable.
+This actually leaves one gap in the detection mechanism since a "tail"
+call to a decorated function via a jump does not push a return
+address; it leaves its own caller's return address on top of the
+stack. So in the call chain A* -> B -> C* where B -> C* is a jump
+rather than a call, C* would mistakenly conclude that it had been
+called directly by A*. There is a way out of this problem though,
+since B is required to preserve the callee-saved r14 register. This
+means that C* can safely read the call tree information provided by A*
+and examine the final call's target address to determine whether the
+call would have gone directly to C* or not. This is made more
+complicated by the presence of the procedure linkage table (PLT) and
+virtual function call "thunks" but I believe it is doable.
 
 In the existing proof-of-concept the tail-call detection is not yet
 implemented but there is a test case in the code that demonstrates the
 problem. The magic value is also stored slightly further away from the
-return address than described above. That can be fixed by converting
-call instructions into a push and jump, where the pushed return
-address is a kind of return thunk which contains the magic value in
-the intended place. Protection against unreadable preceding pages is
-already implemented though, by forcing the return addresses to be
-highly aligned. This means the return is either to the zeroth byte of
-a page or sufficiently far into the page that the magic value is
-guaranteed to be readable.
+return address than described above. That last issue could be fixed by
+converting the call instructions into a push and jump, where the
+pushed return address is a return thunk which contains the magic value
+and a jump back to the code after the original call site. Converting
+the call into a push and jump might be tricky to get right, since it
+will split the basic block containing the call, and probably interfere
+with the pre-call and post-call machine code and live register sets.
+
+Protection against unreadable preceding pages is already implemented,
+by forcing the return addresses to be highly aligned. This means the
+return is either to the zeroth byte of a page or sufficiently far into
+the page that the magic value is guaranteed to be readable.
 
 ### Deciding what calls to inline
 
@@ -136,7 +171,7 @@ Profiling Data Recorded for a Trace-based Just-in-time
 Compiler](https://dl.acm.org/doi/pdf/10.1145/2500828.2500829) by
 Christian Häubl, Christian Wimmer and Hanspeter Mössenböck.
 
-### Call target replacement
+### Call re-targeting
 
 DRTI does not have an implementation of "on-stack replacement". This
 means that the only way that inlining can actually happen is where
@@ -156,6 +191,63 @@ WebKit JavaScript runtime compiler. As I understand it WebKit has
 since moved away from using LLVM but the stack map code could probably
 still be useful for DRTI.
 
-### Deoptimization
+### De-optimization
+
+Currently the recompiled code does not perform any profiling and so
+can't detect the need for "de-optimization". This means that the first
+call target encountered will be the one hard-coded into the recompiled
+version, and any other call targets will go via a slower path without
+any inlining.
 
 ### Virtual function calls
+
+Virtual functions calls are more difficult to inline than normal
+function pointer calls, since overridden functions require an implicit
+type conversion and, in some cases, a pointer adjustment on the
+implicit "this" argument. To see the issue, consider the following classes:
+
+```C++
+struct Base { virtual void foo() = 0; };
+struct Derived : Base { void foo() override; };
+void bar(Base* b)
+{
+    b->foo();
+}
+```
+
+The call to b->foo() looks like this in LLVM bitcode, where it's
+important to note that it is calling a function of type
+void(%struct.Base*):
+
+```asm
+  %vtable = load void (%struct.Base*)**, void (%struct.Base*)*** %0, align 8, !tbaa !1600
+  %1 = load void (%struct.Base*)*, void (%struct.Base*)** %vtable, align 8
+  tail call void %1(%struct.Base* %b)
+```
+
+However the implementation function expects a Derived* as shown here:
+
+```asm
+define void @_ZN7Derived3fooEv(%struct.Derived* nocapture %this)
+```
+
+This makes sense since a member function within the class Derived must
+have a this pointer of the correct type. There isn't enough
+information in the LLVM bitcode to deduce that the type conversion is
+valid, and neither is there information about whether a this pointer
+"fixup" is required, which can arise due to multiple inheritance.
+
+In principle the necessary information could be provided automatically
+by the C++ front-end, but this isn't implemented in the proof of
+concept. Instead the developer must provide pointer conversion
+function(s) explicitly using a DRTI macro called DRTI_CONVERTIBLE, for
+example:
+
+```C++
+DRTI_CONVERTIBLE(Base*, Derived*);
+```
+
+## Feedback
+
+Please contact the author via 62238636+drti@users.noreply.github.com
+with any comments or questions.
