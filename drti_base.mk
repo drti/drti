@@ -25,13 +25,11 @@
 
 DRTI_BASE_DIR := $(dir $(lastword $(MAKEFILE_LIST)))
 
-# Can switch this to release to get some(?) speedup from -DNDEBUG
-LLVM_EXE_ROOT_DIR ?= ~/install/llvm-9.0.1-fast
-LLVM_LIB_ROOT_DIR ?= ~/install/llvm-9.0.1-fast
+LLVM_EXE_ROOT_DIR ?= ~/install/llvm-9.0.1
+LLVM_LIB_ROOT_DIR ?= $(LLVM_EXE_ROOT_DIR)
 
 LLVM_EXE_BIN_DIR = $(LLVM_EXE_ROOT_DIR)/bin
 LLVM_LIB_BIN_DIR = $(LLVM_LIB_ROOT_DIR)/bin
-LLVM_LIB_LIB_DIR = $(LLVM_LIB_ROOT_DIR)/lib
 
 LLVM_CONFIG = $(LLVM_LIB_BIN_DIR)/llvm-config
 
