@@ -27,7 +27,7 @@
 //
 
 // Get type definitions
-#include <drti/tree.hpp>
+#include <drti/runtime.hpp>
 
 // We put the inlinable functions in the global namespace with C
 // linkage just to avoid the complication of using C++ name mangling
@@ -50,7 +50,7 @@ using namespace drti;
             CALL_SITE, CALLER, reinterpret_cast<void*>(FPOINTER));      \
     (CALL_SITE ## _drti_node ?                                          \
      reinterpret_cast<decltype(FPOINTER)>(                              \
-         const_cast<void*>(CALL_SITE ## _drti_node->resolvedTarget)) :  \
+         const_cast<void*>(CALL_SITE ## _drti_node->resolved_target)) : \
      (FPOINTER))
 
 // These functions are declared but don't exist and get rewritten by
@@ -77,7 +77,7 @@ DRTI_INLINE_SUPPORT treenode* _drti_lookup_or_insert(
         assert(caller->caller_abi_version == abi_version);
     }
 
-    // resolvedTarget can be modified later and we initialize it here
+    // resolved_target can be modified later and we initialize it here
     // to the same target
     std::unique_ptr<treenode> new_node(
         new treenode{abi_version, 0, site, caller, target, target, nullptr});
@@ -119,17 +119,3 @@ DRTI_INLINE_SUPPORT void _drti_landed(landing_site& site, treenode* caller)
         }
     }
 }
-
-// #define DRTI_DECLARE_ENTRY_POINT( NAME ) static drti::landing_site NAME
-// #define DRTI_DECLARE_CALLSITE( NAME, LANDING_NAME ) \
-//   static drti::static_callsite NAME = { 0, LANDING_NAME, {} }
-
-// #define DRTI_ENTRY_POINT( NAME, CALLER ) drti::landed(NAME, CALLER)
-
-// #define DRTI_ENTRY_POINT_LOCAL( CALLER )  \
-//   DRTI_DECLARE_ENTRY_POINT(drti_landing); \
-//   DRTI_ENTRY_POINT(drti_landing, CALLER)
-
-// #define DRTI_CALLSITE_LOCAL( NAME ) \
-//   DRTI_DECLARE_CALLSITE(NAME, drti_landing)
-

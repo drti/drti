@@ -23,8 +23,6 @@
 // 2019/11/25   rmg     File creation
 //
 
-#include <drti/runtime.hpp>
-
 #include "llvm/Analysis/InlineCost.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
@@ -42,7 +40,7 @@
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/IPO.h"
 
-#include <drti/tree.hpp>
+#include <drti/runtime.hpp>
 #include <drti/drti-common.hpp>
 
 #include <iostream>
@@ -941,5 +939,5 @@ void drti::compile_treenode(treenode* node)
     TreenodeCompiler& treenode_compiler(*new TreenodeCompiler(node));
 
     // Redirect function pointer to the new machine code
-    node->parent->resolvedTarget = treenode_compiler.compile();
+    node->parent->resolved_target = treenode_compiler.compile();
 }

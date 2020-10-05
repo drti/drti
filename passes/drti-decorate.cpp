@@ -40,7 +40,7 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 
-#include <drti/tree.hpp>
+#include <drti/runtime.hpp>
 #include <drti/drti-common.hpp>
 
 #include <fstream>
@@ -647,14 +647,14 @@ void drti::DecoratePass::decorate_call(
         m_inline->m_drti_call_from, callFromArgs, "treenode");
 
     // We do two things here - replace the target of the call with
-    // the (casted) treenode's resolvedTarget function pointer and
+    // the (casted) treenode's resolved_target function pointer and
     // replace the first argument with the treenode
 
-    llvm::Value* resolvedTarget = builder.CreateStructGEP(
-        treenode, 5, "resolvedTarget");
+    llvm::Value* resolved_target = builder.CreateStructGEP(
+        treenode, 5, "resolved_target");
 
     llvm::Value* newTarget = builder.CreateBitCast(
-        builder.CreateLoad(resolvedTarget),
+        builder.CreateLoad(resolved_target),
         callInst->getCalledOperand()->getType(),
         "castResolvedTarget");
 
