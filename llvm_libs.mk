@@ -25,8 +25,8 @@
 
 include $(dir $(lastword $(MAKEFILE_LIST)))/drti_base.mk
 
-# Flip -std=c++11 to -std=c++17 because it's 2019 now
-LLVM_CXX_FLAGS := $(patsubst %c++11,%c++17,$(shell $(LLVM_CONFIG) --cxxflags))
+# Flip -std=c++14 to -std=c++17 because it's 2020 now
+LLVM_CXX_FLAGS := $(patsubst %c++14,%c++17,$(shell $(LLVM_CONFIG) --cxxflags))
 # We use exceptions
 LLVM_CXX_FLAGS := $(filter-out -fno-exceptions,$(LLVM_CXX_FLAGS))
 

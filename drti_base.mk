@@ -25,7 +25,7 @@
 
 DRTI_BASE_DIR := $(dir $(lastword $(MAKEFILE_LIST)))
 
-LLVM_EXE_ROOT_DIR ?= ~/install/llvm-9.0.1
+LLVM_EXE_ROOT_DIR ?= ~/install/llvm-13
 LLVM_LIB_ROOT_DIR ?= $(LLVM_EXE_ROOT_DIR)
 
 LLVM_EXE_BIN_DIR = $(LLVM_EXE_ROOT_DIR)/bin

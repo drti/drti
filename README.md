@@ -31,23 +31,28 @@ to improve the speed of any real-world applications.
 
 ## Supported Platforms
 
-For now the code only works on Linux on the x86-64 architecture. It is
-dependent on version 9.0.1 of the LLVM libraries.
+For now the code only works on Linux on the x86-64 architecture. It
+requires a small patch to the LLVM sources which I've tested with LLVM
+version 12 and 13.
 
 ## Building the code
 
-In theory it should be possible to clone the git repository and build
-on a supported platform with the correct version (9.0.1) of the LLVM
-libraries installed. You can then build and execute the tests using
-make in the top-level drti directory, providing the path to the root of
-the LLVM installation, e.g.
+1. You'll need to download and unpack the LLVM sources (e.g. [llvm-project-12.0.1.src.tar.xz](https://github.com/llvm/llvm-project/releases/download/llvmorg-12.0.1/llvm-project-12.0.1.src.tar.xz))
+2. Clone the drti git repository, e.g. git clone https://github.com/drti/drti.git
+3. Apply the small LLVM source patch llvm-drti.patch from the drti root directory into the llvm subdirectory, e.g. cd llvm-project-12.0.1.src/llvm && patch -p1 <$HOME/drti/llvm-drti.patch
+4. Configure, build and install LLVM and clang. Some suggested cmake options are -DLLVM_TARGETS_TO_BUILD="X86" -DLLVM_ENABLE_PROJECTS="clang;compiler-rt" -DCMAKE_INSTALL_PREFIX=$HOME/install/llvm-12
+
+You can then cd to the drti root directory to build drti and run its
+tests using make, providing the path to the root of your fresh LLVM
+installation, e.g.
 
 ```sh
-make LLVM_EXE_ROOT_DIR=$HOME/llvm-9.0.1
+make LLVM_EXE_ROOT_DIR=$HOME/install/llvm-12
 ```
 
-The Makefile looks for $(LLVM_EXE_ROOT_DIR)/bin/llvm-config
- 
+Just to be clear, LLVM_EXE_ROOT_DIR should be set so that the Makefile
+can run $(LLVM_EXE_ROOT_DIR)/bin/llvm-config.
+
 Please send [the
 author](mailto:62238636+drti@users.noreply.github.com) feedback if you
 do try this out; I would be interested to hear if anyone else gets it
@@ -142,13 +147,17 @@ virtual function call "thunks" but I believe it is doable.
 In the existing proof-of-concept the tail-call detection is not yet
 implemented but there is a test case in the code that demonstrates the
 problem. The magic value is also stored slightly further away from the
-return address than described above. That last issue could be fixed by
-converting the call instructions into a push and jump, where the
-pushed return address is a return thunk which contains the magic value
-and a jump back to the code after the original call site. Converting
-the call into a push and jump might be tricky to get right, since it
-will split the basic block containing the call, and probably interfere
-with the pre-call and post-call machine code and live register sets.
+return address than described above. This last issue can be fixed by
+making each decorated call go via a small trampoline function that
+overwrites the return address and then jumps to the original call
+target (of course, this will upset the CPU's return address stack a
+little, see [Microbenchmarking Return Address Branch
+Prediction](https://blog.stuffedcow.net/2018/04/ras-microbenchmarks/)
+for a nice discussion of this). The manipulated return address can
+then point to an instruction that jumps back to the code after the
+original call site can can be immediately preceded by the magic
+value. This avoids any risk of mistaking a normal call for a decorated
+one.
 
 Protection against unreadable preceding pages is already implemented,
 by forcing the return addresses to be highly aligned. This means the
@@ -320,6 +329,24 @@ static inline Derived* __drti_converter(Base* value, Derived*)
 As mentioned this is just a workaround; in a more fully developed
 solution there would be automatic support for virtual function call
 type conversion and this pointer fixups.
+
+## The LLVM source code patch
+
+DRTI needs to manipulate LLVM machine instructions to enable the
+passing of call tree information between functions. Although LLVM
+provides various mechanisms for external code to add custom passes
+over the machine-independent Intermediate Representation (IR) I
+couldn't find anything equivalent for the target-specific "machine"
+passes. In general for code to have access to the MachineFunction and
+MachineInstr objects it has to be built in to the LLVM target from
+within the LLVM source tree. There is some support for replacing the
+register allocator via the RegisterRegAlloc class as described in
+[WritingAnLLVMPass](https://www.llvm.org/docs/WritingAnLLVMPass.html)
+but DRTI isn't a register allocator.
+
+For this reason, the llvm-drti.patch file in the drti root directory
+contains minor changes to TargetPassConfig.h and .cpp to support
+custom machine passes in third-party code such as DRTI.
 
 ## Conclusions
 

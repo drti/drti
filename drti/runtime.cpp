@@ -76,12 +76,33 @@ namespace drti
             llvm::orc::MangleAndInterner&,
             //! Other module to check for function definitions (if we
             //! have a definition we want to be able to recompile it)
-            llvm::Module& availableModule);
+            llvm::Module& availableModule) const;
 
         landing_site& m_landing_site;
         reflect& m_self;
         std::unique_ptr<llvm::Module> m_ownModule;
         llvm::Module* m_module;
+    };
+
+    //! Lookups using the global symbols stashed by the drti
+    //! decorator. This allows recompiled code to resolve against the
+    //! exact same addresses which is vital for (e.g.) static
+    //! initialisation guard variables.
+    class ReflectedGlobals : public llvm::orc::DefinitionGenerator
+    {
+    public:
+        ReflectedGlobals(
+            const ReflectedModule&,
+            const ReflectedModule&,
+            llvm::orc::LLJIT&);
+
+        llvm::Error tryToGenerate(
+            llvm::orc::LookupState &LS, llvm::orc::LookupKind K, llvm::orc::JITDylib &JD,
+            llvm::orc::JITDylibLookupFlags JDLookupFlags,
+            const llvm::orc::SymbolLookupSet &LookupSet) override;
+
+    private:
+        llvm::orc::SymbolMap m_globalsMap;
     };
 
     class TreenodeCompiler
@@ -341,7 +362,7 @@ llvm::Function* drti::ReflectedModule::callsite_function()
 void drti::ReflectedModule::globalsMap(
     llvm::orc::SymbolMap& map,
     llvm::orc::MangleAndInterner& mangler,
-    llvm::Module& availableModule)
+    llvm::Module& availableModule) const
 {
     // We must process these in exactly the same order as the code
     // that populated the reflect.globals (see drti-decorate.cpp)
@@ -451,22 +472,63 @@ drti::TreenodeCompiler::TreenodeCompiler(treenode* node) :
     llvm::orc::LLJIT& jit(*m_jit);
 
     // For symbols such as _Unwind_Resume
-    jit.getExecutionSession().getMainJITDylib().setGenerator(
+    jit.getMainJITDylib().addGenerator(
         llvm::cantFail(
             llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
                 jit.getDataLayout().getGlobalPrefix())));
 
+    jit.getMainJITDylib().addGenerator(
+        std::make_unique<ReflectedGlobals>(
+            m_leaf, m_caller, jit));
+}
+
+drti::ReflectedGlobals::ReflectedGlobals(
+    const ReflectedModule& module1,
+    const ReflectedModule& module2,
+    llvm::orc::LLJIT& jit) :
+
+    m_globalsMap()
+{
     llvm::orc::MangleAndInterner mangler(
         jit.getExecutionSession(), jit.getDataLayout());
 
-    llvm::orc::SymbolMap globals_map;
+    module1.globalsMap(m_globalsMap, mangler, *module2.m_module);
+    module2.globalsMap(m_globalsMap, mangler, *module1.m_module);
+}
 
-    m_leaf.globalsMap(globals_map, mangler, *m_caller.m_module);
-    m_caller.globalsMap(globals_map, mangler, *m_leaf.m_module);
+llvm::Error drti::ReflectedGlobals::tryToGenerate(
+    llvm::orc::LookupState&, llvm::orc::LookupKind, llvm::orc::JITDylib& JD,
+    llvm::orc::JITDylibLookupFlags,
+    const llvm::orc::SymbolLookupSet& requested)
+{
+    llvm::orc::SymbolMap mapped;
 
-    llvm::cantFail(
-        jit.getMainJITDylib().define(
-            llvm::orc::absoluteSymbols(globals_map)));
+    for(auto const& pair: requested)
+    {
+        auto found = m_globalsMap.find(pair.first);
+        if(found != m_globalsMap.end())
+        {
+            mapped.insert(*found);
+            if(config.log_level >= log_level::trace)
+            {
+                log_stream
+                    << "DRTI resolved global "
+                    << (*pair.first).str()
+                    << " as "
+                    << reinterpret_cast<const void*>(found->second.getAddress())
+                    << "\n";
+            }
+        }
+    }
+
+    if (mapped.empty())
+    {
+        return llvm::Error::success();
+    }
+    else
+    {
+        return JD.define(llvm::orc::absoluteSymbols(std::move(mapped)));
+    }
 }
 
 std::unique_ptr<llvm::orc::LLJIT> drti::TreenodeCompiler::createJit()

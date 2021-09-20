@@ -1,0 +1,263 @@
+diff --git a/include/llvm/CodeGen/TargetPassConfig.h b/include/llvm/CodeGen/TargetPassConfig.h
+index 11138039a3c5..3f2f44a5bda0 100644
+--- a/include/llvm/CodeGen/TargetPassConfig.h
++++ b/include/llvm/CodeGen/TargetPassConfig.h
+@@ -16,10 +16,12 @@
+ #include "llvm/Pass.h"
+ #include "llvm/Support/CodeGen.h"
+ #include <cassert>
++#include <functional>
+ #include <string>
+ 
+ namespace llvm {
+ 
++class Target;
+ class LLVMTargetMachine;
+ struct MachineSchedContext;
+ class PassConfigImpl;
+@@ -82,6 +84,25 @@ public:
+ /// This is an ImmutablePass solely for the purpose of exposing CodeGen options
+ /// to the internals of other CodeGen passes.
+ class TargetPassConfig : public ImmutablePass {
++public:
++  /// Enum identifying when in the machine pass setup to add an
++  /// extension via a callback.
++  enum MachinePassExtensionPointTy {
++    MPEP_EarlyAsPossible,
++    MPEP_PreRegAlloc,
++    MPEP_PostRegAlloc,
++    MPEP_PreSched2,
++    MPEP_PreEmitPass,
++    MPEP_PreEmitPass2,
++    MPEP_LateAsPossible
++  };
++
++  /// Callback function type for added extensions to a target.
++  using ExtensionFn = std::function<void(TargetPassConfig &)>;
++
++  /// ID used for removing a previously added target extension
++  using ExtensionID = int;
++
+ private:
+   PassManagerBase *PM = nullptr;
+   AnalysisID StartBefore = nullptr;
+@@ -343,6 +364,26 @@ public:
+   /// Returns the CSEConfig object to use for the current optimization level.
+   virtual std::unique_ptr<CSEConfigBase> getCSEConfig() const;
+ 
++  /// Add an extension to be applied to all Targets, returning a
++  /// nonzero ID for use with removeExtension. The preferred way to
++  /// register is via the RegisterTargetExtension class defined
++  /// below. If the extension only applies to particular target(s) the
++  /// ExtensionFn callback can check the properties its
++  /// TargetPassConfig argument, e.g. via TPC.getTM<TargetMachine>().
++  static ExtensionID addExtension(MachinePassExtensionPointTy MPEP,
++                                  ExtensionFn Fn);
++
++  /// Remove a previously added extension. The preferred way to use
++  /// this is via the RegisterTargetExtension class defined below.
++  static void removeExtension(ExtensionID ID);
++
++  /// Add a pass to the PassManager if that pass is supposed to be run, as
++  /// determined by the StartAfter and StopAfter options. Takes ownership of the
++  /// pass.
++  /// @p verifyAfter   if true and adding a machine function pass add an extra
++  ///                  machine verification pass afterwards.
++  void addPass(Pass *P, bool VerifyAfter = true);
++
+ protected:
+   // Helper to verify the analysis is really immutable.
+   void setOpt(bool &Opt, bool Val);
+@@ -453,13 +494,6 @@ protected:
+   ///                  machine verification pass afterwards.
+   AnalysisID addPass(AnalysisID PassID, bool verifyAfter = true);
+ 
+-  /// Add a pass to the PassManager if that pass is supposed to be run, as
+-  /// determined by the StartAfter and StopAfter options. Takes ownership of the
+-  /// pass.
+-  /// @p verifyAfter   if true and adding a machine function pass add an extra
+-  ///                  machine verification pass afterwards.
+-  void addPass(Pass *P, bool verifyAfter = true);
+-
+   /// addMachinePasses helper to create the target-selected or overriden
+   /// regalloc pass.
+   virtual FunctionPass *createRegAllocPass(bool Optimized);
+@@ -468,11 +502,45 @@ protected:
+   /// and rewriting. \returns true if any passes were added.
+   virtual bool addRegAssignAndRewriteFast();
+   virtual bool addRegAssignAndRewriteOptimized();
++
++private:
++  /// Scan the set of extensions and call any registered for our
++  /// Target at the given extension point.
++  void applyAnyExtensions(MachinePassExtensionPointTy MPEP);
+ };
+ 
+ void registerCodeGenCallback(PassInstrumentationCallbacks &PIC,
+                              LLVMTargetMachine &);
+ 
++/// Registers and de-registers a target extension function
++class RegisterTargetExtension {
++  TargetPassConfig::ExtensionID ExtensionID;
++
++public:
++  RegisterTargetExtension(TargetPassConfig::MachinePassExtensionPointTy MPEP,
++                          TargetPassConfig::ExtensionFn Fn)
++      :
++
++        ExtensionID(TargetPassConfig::addExtension(MPEP, std::move(Fn))) {}
++
++  ~RegisterTargetExtension() {
++    if (ExtensionID)
++      TargetPassConfig::removeExtension(ExtensionID);
++  }
++
++  // Movable but not copyable
++  RegisterTargetExtension(RegisterTargetExtension &&Other)
++      :
++
++        ExtensionID(Other.ExtensionID) {
++    Other.ExtensionID = 0;
++  }
++
++  RegisterTargetExtension(const RegisterTargetExtension &) = delete;
++  RegisterTargetExtension &operator=(const RegisterTargetExtension &) = delete;
++  RegisterTargetExtension &operator=(RegisterTargetExtension &&) = delete;
++};
++
+ } // end namespace llvm
+ 
+ #endif // LLVM_CODEGEN_TARGETPASSCONFIG_H
+diff --git a/lib/CodeGen/TargetPassConfig.cpp b/lib/CodeGen/TargetPassConfig.cpp
+index 2d8ecd5025fa..4c2313a1ccb2 100644
+--- a/lib/CodeGen/TargetPassConfig.cpp
++++ b/lib/CodeGen/TargetPassConfig.cpp
+@@ -41,6 +41,7 @@
+ #include "llvm/Support/Debug.h"
+ #include "llvm/Support/Discriminator.h"
+ #include "llvm/Support/ErrorHandling.h"
++#include "llvm/Support/ManagedStatic.h"
+ #include "llvm/Support/SaveAndRestore.h"
+ #include "llvm/Support/Threading.h"
+ #include "llvm/Target/CGPassBuilderOption.h"
+@@ -50,6 +51,7 @@
+ #include "llvm/Transforms/Utils/SymbolRewriter.h"
+ #include <cassert>
+ #include <string>
++#include <tuple>
+ 
+ using namespace llvm;
+ 
+@@ -238,6 +240,12 @@ static cl::opt<bool> DisableExpandReductions(
+     "disable-expand-reductions", cl::init(false), cl::Hidden,
+     cl::desc("Disable the expand reduction intrinsics pass from running"));
+ 
++using GlobalExtensionTy =
++    std::tuple<TargetPassConfig::MachinePassExtensionPointTy,
++               TargetPassConfig::ExtensionFn, TargetPassConfig::ExtensionID>;
++
++static ManagedStatic<SmallVector<GlobalExtensionTy, 2>> GlobalExtensions;
++
+ /// Allow standard passes to be disabled by command line options. This supports
+ /// simple binary flags that either suppress the pass or do nothing.
+ /// i.e. -disable-mypass=false has no effect.
+@@ -681,6 +689,35 @@ bool TargetPassConfig::isPassSubstitutedOrOverridden(AnalysisID ID) const {
+       FinalPtr.getID() != ID;
+ }
+ 
++auto TargetPassConfig::addExtension(MachinePassExtensionPointTy MPEP,
++                                    ExtensionFn Fn) -> ExtensionID {
++  static ExtensionID Counter = 0;
++  ExtensionID ID = ++Counter;
++  GlobalExtensions->push_back(std::make_tuple(MPEP, Fn, ID));
++  return ID;
++}
++
++void TargetPassConfig::removeExtension(ExtensionID ID) {
++  if (!GlobalExtensions.isConstructed())
++    return;
++
++  auto *I = llvm::find_if(*GlobalExtensions, [ID](const auto &Elem) {
++    return std::get<2>(Elem) == ID;
++  });
++
++  if (I != GlobalExtensions->end())
++    GlobalExtensions->erase(I);
++}
++
++void TargetPassConfig::applyAnyExtensions(MachinePassExtensionPointTy MPEP) {
++  if (GlobalExtensions.isConstructed() && !GlobalExtensions->empty()) {
++    for (const auto &Ext : *GlobalExtensions) {
++      if (std::get<0>(Ext) == MPEP)
++        std::get<1>(Ext)(*this);
++    }
++  }
++}
++
+ /// Add a pass to the PassManager if that pass is supposed to be run.  If the
+ /// Started/Stopped flags indicate either that the compilation should start at
+ /// a later pass or that it should stop after an earlier pass, then do not add
+@@ -1088,11 +1125,16 @@ static cl::opt<RegisterRegAlloc::FunctionPassCtor, false,
+ /// tied to a common pass. But if it has subtle dependencies on multiple passes,
+ /// the target should override the stage instead.
+ ///
++/// External code can customize the passes added here for any target
++/// via the addGlobalExtension function.
++///
+ /// TODO: We could use a single addPre/Post(ID) hook to allow pass injection
+ /// before/after any target-independent pass. But it's currently overkill.
+ void TargetPassConfig::addMachinePasses() {
+   AddingMachinePasses = true;
+ 
++  applyAnyExtensions(MPEP_EarlyAsPossible);
++
+   // Add passes that optimize machine instructions in SSA form.
+   if (getOptLevel() != CodeGenOpt::None) {
+     addMachineSSAOptimization();
+@@ -1107,6 +1149,7 @@ void TargetPassConfig::addMachinePasses() {
+ 
+   // Run pre-ra passes.
+   addPreRegAlloc();
++  applyAnyExtensions(MPEP_PreRegAlloc);
+ 
+   // Debugifying the register allocator passes seems to provoke some
+   // non-determinism that affects CodeGen and there doesn't seem to be a point
+@@ -1121,6 +1164,7 @@ void TargetPassConfig::addMachinePasses() {
+     addFastRegAlloc();
+ 
+   // Run post-ra passes.
++  applyAnyExtensions(MPEP_PostRegAlloc);
+   addPostRegAlloc();
+ 
+   addPass(&FixupStatepointCallerSavedID);
+@@ -1145,6 +1189,7 @@ void TargetPassConfig::addMachinePasses() {
+ 
+   // Run pre-sched2 passes.
+   addPreSched2();
++  applyAnyExtensions(MPEP_PreSched2);
+ 
+   if (EnableImplicitNullChecks)
+     addPass(&ImplicitNullChecksID);
+@@ -1185,6 +1230,7 @@ void TargetPassConfig::addMachinePasses() {
+         sampleprof::FSDiscriminatorPass::PassLast));
+ 
+   addPreEmitPass();
++  applyAnyExtensions(MPEP_PreEmitPass);
+ 
+   if (TM->Options.EnableIPRA)
+     // Collect register usage information and produce a register mask of
+@@ -1221,11 +1267,14 @@ void TargetPassConfig::addMachinePasses() {
+ 
+   // Add passes that directly emit MI after all other MI passes.
+   addPreEmitPass2();
++  applyAnyExtensions(MPEP_PreEmitPass2);
+ 
+   // Insert pseudo probe annotation for callsite profiling
+   if (TM->Options.PseudoProbeForProfiling)
+     addPass(createPseudoProbeInserter());
+ 
++  applyAnyExtensions(MPEP_LateAsPossible);
++
+   AddingMachinePasses = false;
+ }
+ 

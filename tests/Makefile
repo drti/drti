@@ -30,9 +30,9 @@ OPT = -O3
 
 DRTI_LIB = $(DRTI_BASE_DIR)passes/libdrti.so
 
-LOAD_DRTI_PASS = -load $(DRTI_LIB) -debug-only=drti
+LLVM_OPT_FLAGS += -enable-new-pm -load-pass-plugin=$(DRTI_LIB) -debug-only=drti
 
-LLCFLAGS += $(LOAD_DRTI_PASS)
+LLCFLAGS += -load=$(DRTI_LIB) -debug-only=drti
 
 # Export this as an environment variable for use by the drti-decorate
 # LLVM pass
@@ -68,7 +68,7 @@ intercept_tests-drti: \
 	$(PLAIN_MODULES:%=%.o)
 
 %-drti.bc: %.bc $(DRTI_LIB) $(DRTI_TARGETS_FILE)
-	$(LLVM_OPT) $(LOAD_DRTI_PASS) $(OPT) -drti-decorate -o $@ $<
+	$(LLVM_OPT) $(LLVM_OPT_FLAGS) $(OPT) -o $@ $<
 
 CLEANABLE += raw_tests-drti intercept_tests-drti
 

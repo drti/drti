@@ -36,6 +36,8 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/Linker/Linker.h"
 #include "llvm/Pass.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
@@ -45,6 +47,7 @@
 
 #include <fstream>
 #include <istream>
+#include <optional>
 #include <sstream>
 #include <unordered_set>
 
@@ -54,50 +57,55 @@ extern const char _binary_drti_inline_bc_end[];
 
 namespace drti
 {
-    struct Decorate : public llvm::ModulePass
+    struct Decorate : public llvm::PassInfoMixin<Decorate>
     {
-        static char ID;
-
-        Decorate();
-
-        bool runOnModule(llvm::Module&) override;
+        llvm::PreservedAnalyses run(
+            llvm::Module& M, llvm::ModuleAnalysisManager&);
+        bool runOnModule(llvm::Module&);
     };
 }
 
-char drti::Decorate::ID = 0;
-
-static llvm::RegisterPass<drti::Decorate> registrar1(
-    "drti-decorate",
-    "Dynamic runtime inlining decoration pass",
-    true /* Does modify CFG */,
-    false /* Is not an analysis pass */);
-
-static void registerDecorate(
-    const llvm::PassManagerBuilder&,
-    llvm::legacy::PassManagerBase& PM)
-{
-    PM.add(new drti::Decorate());
-}
-
-// TODO - finding the right place in the pipeline is tricky. Ideally
-// we want to run after optimizations so that we serialized
-// already-optimized bitcode to help the JIT run faster, but on the
-// other hand we almost certainly want another round of inlining after
-// we're done. Refer to llvm/lib/Transforms/IPO/PassManagerBuilder.cpp
-// for the options details.
-static llvm::RegisterStandardPasses registrar2(
-    llvm::PassManagerBuilder::EP_OptimizerLast, // EP_ModuleOptimizerEarly, // EP_Peephole, EP_CGSCCOptimizerLate, EP_Peephole, EP_ScalarOptimizerLate, EP_OptimizerLast?
-    registerDecorate);
-
-drti::Decorate::Decorate() :
-    ModulePass(ID)
-{
+/* New PM Registration */
+extern "C" llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK llvmGetPassPluginInfo() {
+  return {
+      LLVM_PLUGIN_API_VERSION, "drti-decorate", LLVM_VERSION_STRING,
+      [](llvm::PassBuilder &PB) {
+          // TODO - finding the right place in the pipeline is
+          // tricky. Ideally we want to run after optimizations so
+          // that we serialized already-optimized bitcode to help the
+          // JIT run faster, but on the other hand we almost certainly
+          // want another round of inlining after we're done. Refer to
+          // llvm/lib/Transforms/IPO/PassManagerBuilder.cpp for the
+          // options details.
+          PB.registerOptimizerLastEPCallback(
+              [](
+                  llvm::ModulePassManager &PM,
+                  llvm::PassBuilder::OptimizationLevel Level) {
+                  PM.addPass(drti::Decorate());
+              });
+          PB.registerPipelineParsingCallback(
+              [](
+                  llvm::StringRef Name,
+                  llvm::ModulePassManager &PM,
+                  llvm::ArrayRef<llvm::PassBuilder::PipelineElement>) {
+                  if (Name == "drti-decorate") {
+                      PM.addPass(drti::Decorate());
+                      return true;
+                  }
+                  return false;
+              });
+      }
+  };
 }
 
 // Check member is at a specific offset
-#define CHECK_MEMBER(CLASS, MEMBER, TYPE, OFFSET) \
-    static_assert(std::is_same<decltype(std::declval<CLASS>().MEMBER), TYPE>::value); \
-    static_assert(offsetof(CLASS, MEMBER) == OFFSET);
+#define CHECK_MEMBER(CLASS, MEMBER, TYPE, OFFSET)                       \
+    static_assert(                                                      \
+        std::is_same<decltype(std::declval<CLASS>().MEMBER), TYPE>::value, \
+        "DRTI Builtin type mismatch");                                  \
+    static_assert(                                                      \
+        offsetof(CLASS, MEMBER) == OFFSET,                              \
+        "DRTI Builtin member offset mismatch");
 
 // Check adjacency between previous and next members
 #define CHECK_MEMBER_P(CLASS, MEMBER, TYPE, PREVIOUS) \
@@ -278,13 +286,12 @@ bool drti::DecoratePass::find_target_functions()
         if(m_target_function_names.find(function.getName().str()) !=
            m_target_function_names.end())
         {
-            if(!function.isDeclaration())
-            {
-                DEBUG_WITH_TYPE(
-                    "drti",
-                    llvm::dbgs() << "drti: found target function definition "
-                    << function.getName() << "\n");
-            }
+            DEBUG_WITH_TYPE(
+                "drti",
+                llvm::dbgs()
+                << "drti: found target function "
+                << (function.isDeclaration() ? "declaration " : "definition ")
+                << function.getName() << "\n");
 
             m_target_functions.insert(&function);
             m_target_function_types.insert(function.getFunctionType());
@@ -341,13 +348,13 @@ bool drti::DecoratePass::add_helpers()
 
 drti::InlineHelpers::InlineHelpers(llvm::Module& module) :
     m_drti_landing_site_type(
-        module.getTypeByName("struct.drti::landing_site")),
+        llvm::StructType::getTypeByName(module.getContext(), "struct.drti::landing_site")),
     m_drti_callsite_type(
-        module.getTypeByName("struct.drti::static_callsite")),
+        llvm::StructType::getTypeByName(module.getContext(), "struct.drti::static_callsite")),
     m_drti_treenode_type(
-        module.getTypeByName("struct.drti::treenode")),
+        llvm::StructType::getTypeByName(module.getContext(), "struct.drti::treenode")),
     m_drti_reflect_type(
-        module.getTypeByName("struct.drti::reflect")),
+        llvm::StructType::getTypeByName(module.getContext(), "struct.drti::reflect")),
     m_drti_landed(
         module.getFunction("_drti_landed")),
     m_drti_call_from(
@@ -580,18 +587,19 @@ llvm::Value* drti::DecoratePass::add_landing_update(
     //    has_magic = maybe_magic == DRTI_MAGIC
     //    br i1 has_magic drti_land3, drti_land1
     builder.SetInsertPoint(land2);
-    llvm::Type* ptr_int64_t =
-        llvm::IntegerType::get(m_module.getContext(), 64)->getPointerTo();
+    llvm::Type* int64_ty =
+        llvm::IntegerType::get(m_module.getContext(), 64);
+    llvm::Type* ptr_int64_ty = int64_ty->getPointerTo();
     llvm::Value* returnAddressCast = builder.CreateIntToPtr(
-        returnAddress, ptr_int64_t, "drtiRetAddressCast");
+        returnAddress, ptr_int64_ty, "drtiRetAddressCast");
     static_assert(DRTI_RETALIGN % sizeof(int64_t) == 0, "Invalid DRTI_RETALIGN");
     llvm::Value* indexes[] = {
         llvm::ConstantInt::get(
             llvm::IntegerType::get(m_module.getContext(), 64),
             -DRTI_RETALIGN / sizeof(int64_t))
     };
-    llvm::Value* gep = builder.CreateGEP(returnAddressCast, indexes, "drtiGep");
-    llvm::Value* maybeMagic = builder.CreateLoad(gep, "drtiMaybeMagic");
+    llvm::Value* gep = builder.CreateGEP(int64_ty, returnAddressCast, indexes, "drtiGep");
+    llvm::Value* maybeMagic = builder.CreateLoad(int64_ty, gep, "drtiMaybeMagic");
     llvm::Constant* magic = llvm::ConstantInt::get(
         llvm::IntegerType::get(m_module.getContext(), 64), DRTI_MAGIC);
     llvm::Value* matches = builder.CreateICmpEQ(maybeMagic, magic, "drtiMatches");
@@ -632,12 +640,14 @@ void drti::DecoratePass::decorate_call(
     // Insert new code before the original call
     llvm::IRBuilder<> builder(callInst);
 
+    // In llvm i8* is equivalent to void*
+    llvm::Type* void_ptr_ty =
+        llvm::IntegerType::get(m_module.getContext(), 8)->getPointerTo();
+
     // Cast the original target to void* for passing to
-    // _drti_call_from. i8* is equivalent to void*
+    // _drti_call_from.
     llvm::Value* oldTarget = builder.CreateBitCast(
-        callInst->getCalledOperand(),
-        llvm::IntegerType::get(m_module.getContext(), 8)->getPointerTo(),
-        "castOldTarget");
+        callInst->getCalledOperand(), void_ptr_ty, "castOldTarget");
 
     llvm::Value* callFromArgs[] = {
         callsite, caller, oldTarget
@@ -646,15 +656,16 @@ void drti::DecoratePass::decorate_call(
     llvm::Value* treenode = builder.CreateCall(
         m_inline->m_drti_call_from, callFromArgs, "treenode");
 
-    // We do two things here - replace the target of the call with
-    // the (casted) treenode's resolved_target function pointer and
-    // replace the first argument with the treenode
+    // We do two things here - replace the target of the call with the
+    // (casted) treenode's resolved_target function pointer and pass
+    // the treenode pointer via the _drti_set_caller "function" which
+    // the caller retrieves via _drti_caller
 
     llvm::Value* resolved_target = builder.CreateStructGEP(
-        treenode, 5, "resolved_target");
+        m_inline->m_drti_treenode_type, treenode, 5, "resolved_target");
 
     llvm::Value* newTarget = builder.CreateBitCast(
-        builder.CreateLoad(resolved_target),
+        builder.CreateLoad(void_ptr_ty, resolved_target),
         callInst->getCalledOperand()->getType(),
         "castResolvedTarget");
 
@@ -784,6 +795,13 @@ void drti::DecoratePass::add_landing_globals()
     {
         if(!function->isDeclaration())
         {
+            DEBUG_WITH_TYPE(
+                "drti",
+                llvm::dbgs()
+                << "drti: decorating definition "
+                << function->getName()
+                << "\n");
+
             // Find any outgoing calls to be decorated, before
             // modifying the function
             std::vector<std::pair<unsigned, llvm::CallBase*>> calls(
@@ -897,6 +915,20 @@ llvm::GlobalVariable* drti::DecoratePass::create_callsite_global(
     return variable;
 }
 
+llvm::PreservedAnalyses drti::Decorate::run(
+    llvm::Module& module, llvm::ModuleAnalysisManager&)
+{
+    if (!runOnModule(module))
+    {
+        return llvm::PreservedAnalyses::all();
+    }
+    else
+    {
+        return llvm::PreservedAnalyses::none();
+    }
+}
+
+
 bool drti::Decorate::runOnModule(llvm::Module& module)
 {
     const std::string& targetTriple(module.getTargetTriple());
@@ -931,9 +963,6 @@ bool drti::Decorate::runOnModule(llvm::Module& module)
 
     decorator.add_landing_globals();
 //    decorator.set_initializers();
-
-    // This lets our machine code passes run on the module as well
-    module.setTargetTriple("x86_64_drti-unknown-linux-gnu");
 
     return true;
 }
